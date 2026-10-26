@@ -1,0 +1,228 @@
+# Stage 2: train SIPE-SR Predictor for x4 SR
+name: 02_SIPE_predictor_X4
+model_type: SIPEPredictorModel
+scale: &upscale 4
+num_gpu: 4
+manual_seed: 0
+bsz: &bsz 4
+
+datasets:
+  train:
+    name: SR_Image_Train_X4
+    type: PairedImageDataset
+    dataroot_gt: datasets/train/HQ_sub
+    dataroot_lq: datasets/train/LQ_sub_X4
+    io_backend:
+      type: disk
+    gt_size: 256
+    scale: *upscale
+    use_resize_crop: false
+    use_flip: true
+    use_rot: true
+    use_shuffle: true
+    batch_size_per_gpu: *bsz
+    num_worker_per_gpu: 4
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cpu
+    num_prefetch_queue: 128
+  val:
+    name: SR_Image_Valid_X4
+    type: PairedImageDataset
+    dataroot_gt: datasets/valid/HR
+    dataroot_lq: datasets/valid/LR_X4
+#    max_num: 10
+    io_backend:
+      type: disk
+    scale: *upscale
+
+network_g:
+  type: SIPETokenNet
+  gt_resolution: 256
+  scale_factor: *upscale
+  LQ_stage: true
+  code_only: false
+  predictor_blk_depth: 6
+  predictor_blk_num: 4
+  predictor_num_heads: 8
+  predictor_window_size: 8
+  lq_base_ch: 64
+  lq_swin_blk_depth: 6
+  lq_swin_blk_num: 2
+  use_guided_refine: true
+  use_sft_fusion: true
+  # Reuse the token encoder pyramid; SFT adapters receive stop-gradient features.
+  sft_cond_source: shared_lq
+  sft_levels: [8, 4]  # X4 shared LR pyramid starts at HR/4; no HR/2 feature.
+  sft_zero_init: true
+  refine_blocks: 4
+  refine_channels: 64
+  vqgan_opt:
+    ckpt_path: ~
+    n_embed: 1024
+    embed_dim: 256
+    use_quant_conv: true
+    quant_conv_init: identity
+    ddconfig:
+      in_channels: 3
+      emb_dim: 256
+      resolution: [256, 256]
+      nf: 128
+      global_blks: swin
+      swin_dim: 256
+      swin_window: 8
+      swin_blk_depth: 6
+      swin_blk_num: 1
+      ch_mult: [1, 2, 2, 4]
+
+network_hq:
+  type: VQModel
+  ckpt_path: ~
+  n_embed: 1024
+  embed_dim: 256
+  use_quant_conv: true
+  quant_conv_init: identity
+  ddconfig:
+    in_channels: 3
+    emb_dim: 256
+    resolution: [256, 256]
+    nf: 128
+    global_blks: swin
+    swin_dim: 256
+    swin_window: 8
+    swin_blk_depth: 6
+    swin_blk_num: 1
+    ch_mult: [1, 2, 2, 4]
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+
+path:
+  # Reuse the X2 predictor's VQ prior/codebook for consistent token IDs.
+  pretrain_network_hq: null
+  pretrain_network_g: experiments/02_SIPE_predictor_X2/models/net_g_latest.pth
+  pretrain_network_d: null
+  strict_load: false  # Skip incompatible X2 encoder/adapter weights; train them in X4 Stage 2.
+  strict_load_hq: false
+  resume_state: null  # Transfer weights only; start new X4 optimizers and schedules.
+  ignore_resume_networks: [network_hq]
+
+train:
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_dtype: bfloat16
+
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+#  scheduler:
+#    type: MultiStepLR
+#    milestones: [50000, 100000, 150000, 200000, 250000, 300000, 350000]
+#    gamma: 1
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [400000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5 # no lr reduce in official vqgan code
+  total_iter: 400000
+  warmup_iter: -1
+  token_schedule: cosine
+  # Pure LR inputs are sampled only by predictor_full_lq_prob.
+  predictor_full_lq_prob: 0.2
+  # Self-context and GT-context share semantic-gap + random-noise mask selection
+  # via dino_guidance_opt.mask_guided, with the same cosine mask count.
+  predictor_self_context_opt:
+    enabled: true
+    prob: 0.5
+    start_iter: 200000
+    warmup_iter: 20000
+  soft_decode_opt:
+    enabled: false
+    tau: 1.0
+    tau_min: 0.5
+    anneal_iter: 100000
+    straight_through: true
+  feature_opt:
+    loss_weight: 0.25
+  cross_entropy_opt:
+    token_weight: 1.0
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  dino_opt:
+    backend: torchhub
+    model_name: dinov2_vitb14_reg
+    repo_or_dir: facebookresearch/dinov2
+    source: github
+    input_size: 448
+    patch_size: 14
+    global_weight: 0.05
+    local_weight: 0.10
+    latent_weight: 0.0
+    normalize_latent: true
+
+  dino_guidance_opt:
+    start_iter: 0
+    warmup_iter: 10000
+    mask_guided: true
+    mask_random_ratio: 0.20
+    token_reweight: false
+    token_weight_boost: 0.0
+    feature_weight_boost: 0.0
+    saliency_weight: 0.0
+    difficulty_weight: 1.0
+    lq_latent_weight: 0.0
+  perceptual_opt:
+    type: LPIPSLoss
+    loss_weight: !!float 1.0
+  struct_opt:
+    type: ssimc
+    loss_weight: !!float 1.0
+  # Adversarial supervision on the decoded SR image, matching the X2 objective.
+  gan_opt:
+    type: GANLoss
+    gan_type: hinge
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: 0.1
+  net_d_iters: 1
+  net_d_start_iter: 30001
+
+val:
+  val_freq: !!float 1e4
+  save_img: true
+  tile_min_size: 64000000
+  key_metric: lpips
+  metrics:
+    psnr:
+      type: psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: ssim
+      crop_border: 4
+      test_y_channel: true
+    lpips:
+      type: lpips
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 1e4
+  save_latest_freq: !!float 1e4
+  show_tf_imgs_freq: !!float 1e4
+  use_tb_logger: true
+
+dist_params:
+  backend: nccl
+  port: 16602
+find_unused_parameters: true

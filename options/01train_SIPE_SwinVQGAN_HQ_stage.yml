@@ -1,0 +1,194 @@
+# Stage 1: train DINO-style SwinVQGAN prior for SIPE-SR
+name: 01_SIPE_SwinVQGAN_HQ_stage_DINOv2SemVQ
+model_type: SwinVQGANModel
+scale: &upscale 1
+num_gpu: 4
+manual_seed: 0
+bsz: &bsz 4
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: HQ_Image_Train
+    type: PairedImageDataset
+    dataroot_gt: /gemini/data-2/HQ_subimages
+    dataroot_lq: /gemini/data-2/HQ_subimages
+    io_backend:
+      type: disk
+
+    gt_size: 256
+    scale: *upscale
+    use_resize_crop: false
+    use_flip: true
+    use_rot: true
+
+    use_shuffle: true
+    batch_size_per_gpu: *bsz
+    num_worker_per_gpu: 4
+    dataset_enlarge_ratio: 1
+
+    prefetch_mode: cpu
+    num_prefetch_queue: 128
+
+  val:
+    name: General_Image_Valid
+    type: PairedImageDataset
+    dataroot_gt: /gemini/data-2/div2k_valid/gt_mod16
+    dataroot_lq: /gemini/data-2/div2k_valid/gt_mod16
+#    max_num: 10
+    io_backend:
+      type: disk
+
+network_g:
+  type: VQModel
+  n_embed: 1024
+  embed_dim: 256
+  use_quant_conv: true
+  quant_conv_init: identity
+  ddconfig:
+    in_channels: 3
+    emb_dim: 256
+    resolution: [256, 256]
+    nf: 128
+    ch_mult: [1, 2, 2, 4]
+
+    global_blks: 'swin'
+    swin_dim: 256
+    swin_window: 8
+    swin_blk_depth: 6
+    swin_blk_num: 1
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+
+path:
+  pretrain_network_g: ~
+  pretrain_network_d: ~
+  strict_load: false
+
+train:
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_dtype: bfloat16
+
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    betas: [0.9, 0.99]
+
+  optim_d:
+    type: Adam
+    lr: !!float 1e-4
+    betas: [0.9, 0.99]
+
+#  scheduler:
+#    type: MultiStepLR
+#    milestones: [50000, 100000, 150000, 200000, 250000, 300000, 350000]
+#    gamma: 1
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [800000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5 # no lr reduce in official vqgan code
+
+  # Optimizer-update count. The trainer multiplies iteration/frequency options
+  # by gradient_accumulation_steps internally.
+  total_iter: 800000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  perceptual_opt:
+    type: LPIPSLoss
+    loss_weight: !!float 1.0
+
+  struct_opt:
+    type: ssimc
+    loss_weight: !!float 1.0
+
+  gan_opt:
+    type: GANLoss
+    gan_type: hinge
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: 0.1
+
+  codebook_opt:
+    loss_weight: 1.0
+
+  # DINO semantic prior for stage-1. DINOv2 remains the default.
+  # For limited GPU memory, start with dinov2_vits14_reg or input_size: 224.
+  # For DINOv3, use a local facebookresearch/dinov3 checkout and set weights to
+  # the downloaded checkpoint path or URL. Recommended first ablation:
+  #
+  # dino_opt:
+  #   backend: torchhub
+  #   model_name: dinov3_vitb16
+  #   repo_or_dir: /path/to/dinov3
+  #   source: local
+  #   weights: /path/to/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  #   input_size: 512 # 512 / 16 = 32, matching the 256-input VQ latent grid.
+  #   patch_size: 16
+  #   global_weight: 0.05
+  #   local_weight: 0.10
+  #   latent_weight: 0.01
+  #   normalize_latent: true
+  dino_opt:
+    backend: torchhub
+    model_name: dinov2_vitb14_reg
+    repo_or_dir: facebookresearch/dinov2
+    source: github
+    input_size: 448 # patch_size * gt_size // 2^(len(ch_mult) - 1)
+    patch_size: 14
+    global_weight: 0.05
+    local_weight: 0.10
+    latent_weight: 0.01
+    normalize_latent: true
+
+  # DINO/random masked reconstruction is the main Stage-1 input path.
+  # Disable by setting enabled: false; losses still use the normal Stage-1 weights above.
+  dino_mask_opt:
+    enabled: true
+    mask_ratio: [-0.1, 0.5]
+    mode: 'mixed'      # semantic | random | mixed
+    semantic_prob: 0.50 # mixed samples semantic vs random masking with this probability
+    fill: 0.5
+
+  net_d_iters: 1
+  net_d_start_iter: 30001
+
+val:
+  val_freq: !!float 5e4
+  save_img: false
+
+  key_metric: lpips
+  metrics:
+    psnr:
+      type: psnr
+      crop_border: 4
+      test_y_channel: true
+      color_space: ycbcr
+    ssim:
+      type: ssim
+      crop_border: 4
+      test_y_channel: true
+      color_space: ycbcr
+    lpips:
+      type: lpips
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e4
+  save_latest_freq: !!float 5e4
+  show_tf_imgs_freq: !!float 5e4
+  use_tb_logger: true
+
+dist_params:
+  backend: nccl
+  port: 16500
+find_unused_parameters: true
